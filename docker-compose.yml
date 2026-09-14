@@ -1,0 +1,96 @@
+services:
+  # ─────────────────────────────────────────────
+  #  PostgreSQL
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: taqueria_don_puerco
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d pase_lista"]
+      interval: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    networks:
+      - app-network
+
+
+  # ─────────────────────────────────────────────
+  #  ClickHouse
+  # ─────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8-alpine
+    container_name: clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_DB: taqueria_don_puerco
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 5s
+      retries: 10
+    ports:
+      - "8123:8123" # Puerto HTTP (Usado por APIs y la consola web integrada)
+      - "9000:9000" # Puerto nativo (Usado por clientes, Python, Go, etc.)
+    networks:
+      - app-network
+
+  # ─────────────────────────────────────────────
+  #  DBeaver
+  # ─────────────────────────────────────────────
+  cloudbeaver:
+    image: dbeaver/cloudbeaver:26.2
+    container_name: cloudbeaver
+    restart: unless-stopped
+    ports:
+      - "5050:8978" # CloudBeaver corre por defecto en el puerto 8978 internamente
+    depends_on:
+      - clickhouse
+    networks:
+      - app-network
+
+volumes:
+  clickhouse_data:
+  postgres_data:
+
+networks:
+  app-network:
+    driver: bridge
+
+
+  # ─────────────────────────────────────────────
+  #  Streamlit — Dashboard
+  # ─────────────────────────────────────────────
+#  streamlit-dashboard:
+#    build:
+#      context: ./streamlit-dashboard
+#      dockerfile: Dockerfile
+#    container_name: streamlit-dashboard
+#    restart: unless-stopped
+#    environment:
+#      DB_HOST: postgres
+#      DB_PORT: "5432"
+#      DB_NAME: pase_lista
+#      DB_USER: admin
+#      DB_PASSWORD: admin123
+#    ports:
+#      - "8502:8501"
+#    depends_on:
+#      - postgres
+#    networks:
+#      - app-network
+
+# JUST TESTEO
