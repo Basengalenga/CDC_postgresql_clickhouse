@@ -1,11 +1,12 @@
 services:
   # ─────────────────────────────────────────────
-  #  PostgreSQL
+  #  PostgreSQL (origen para PeerDB CDC)
   # ─────────────────────────────────────────────
   postgres:
     image: postgres:16
     container_name: postgres
     restart: unless-stopped
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: admin123
@@ -14,7 +15,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d pase_lista"]
+      test: ["CMD-SHELL", "pg_isready -U admin -d taqueria_don_puerco"]
       interval: 5s
       retries: 10
     ports:
@@ -22,9 +23,8 @@ services:
     networks:
       - app-network
 
-
   # ─────────────────────────────────────────────
-  #  ClickHouse
+  #  ClickHouse (destino del mirror CDC)
   # ─────────────────────────────────────────────
   clickhouse:
     image: clickhouse/clickhouse-server:26.8-alpine
@@ -49,7 +49,7 @@ services:
       - app-network
 
   # ─────────────────────────────────────────────
-  #  DBeaver
+  #  CloudBeaver
   # ─────────────────────────────────────────────
   cloudbeaver:
     image: dbeaver/cloudbeaver:26.2
@@ -65,52 +65,301 @@ services:
   # ─────────────────────────────────────────────
   #  Generador de data
   # ─────────────────────────────────────────────
-
   generador:
     build:
       context: ./generador
       dockerfile: Dockerfile
     container_name: generator
     restart: unless-stopped
-
     depends_on:
       - postgres
       - clickhouse
     networks:
       - app-network
 
+  # ─────────────────────────────────────────────
+  #  Streamlit — Dashboard
+  # ─────────────────────────────────────────────
+  dashboard:
+      build:
+        context: ./dashboard
+        dockerfile: Dockerfile
+      container_name: dashboard
+      restart: unless-stopped
+      ports:
+        - "8501:8501"
+      depends_on:
+        - postgres
+      networks:
+        - app-network
+
+  # ═════════════════════════════════════════════
+  #  PeerDB — CDC Postgres -> ClickHouse
+  # ═════════════════════════════════════════════
+
+  catalog:
+    image: postgres:17-alpine
+    container_name: peerdb-catalog
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+    volumes:
+      - peerdb_catalog_data:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  temporal:
+    image: temporalio/auto-setup:1.27
+    container_name: temporal
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PWD: postgres
+      POSTGRES_SEEDS: catalog
+      #DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    depends_on:
+      catalog:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  temporal-admin-tools:
+    image: temporalio/admin-tools:1.27
+    container_name: temporal-admin-tools
+    restart: "no"
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CLI_ADDRESS: temporal:7233
+    depends_on:
+      - temporal
+    healthcheck:
+      test: ["CMD-SHELL", "temporal operator search-attribute list --address temporal:7233 --namespace default 2>/dev/null | grep -q MirrorName || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    entrypoint: |
+          /bin/sh -c "
+          echo 'Esperando a que el motor de Temporal esté 100% online...'
+          until temporal operator cluster health --address temporal:7233 | grep -q SERVING; do
+            echo 'Temporal aún no está listo. Reintentando en 3 segundos...';
+            sleep 3;
+          done;
+
+          echo 'Temporal online. Configurando namespace...'
+          temporal operator namespace describe --address temporal:7233 --namespace default || temporal operator namespace create --address temporal:7233 --retention 3d default;
+
+          echo 'Registrando atributo MirrorName para PeerDB...'
+          ATTEMPTS=0
+          until temporal operator search-attribute create --address temporal:7233 --namespace default --name MirrorName --type Keyword 2>&1 | tee /tmp/sa.log; do
+            if grep -qi 'already exists\|already registered' /tmp/sa.log; then
+              echo 'MirrorName ya estaba registrado, continuando.';
+              break;
+            fi;
+            ATTEMPTS=\$((ATTEMPTS+1));
+            if [ \$ATTEMPTS -ge 20 ]; then
+              echo 'No se pudo registrar MirrorName tras 20 intentos. Abortando.';
+              exit 1;
+            fi;
+            echo \"El namespace aún no es visible para search-attributes. Reintentando (\$ATTEMPTS/20) en 3 segundos...\";
+            sleep 3;
+          done;
+
+          echo '¡Configuración de Temporal finalizada de forma segura!'
+          sleep infinity
+          "
+    networks:
+      - app-network
+
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: peerdb-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - peerdb_minio_data:/data
+    entrypoint: >
+      /bin/sh -c "
+      minio server /data --console-address=:9091 &
+      sleep 3;
+      mc alias set local http://localhost:9000 minioadmin minioadmin;
+      mc mb local/peerdb --ignore-existing;
+      wait"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live"]
+      interval: 5s
+      retries: 10
+    ports:
+      - "9001:9000"
+      - "9091:9091"
+    networks:
+      - app-network
+
+  flow-api:
+    image: ghcr.io/peerdb-io/flow-api:stable-v0.36.17
+    container_name: flow-api
+    restart: unless-stopped
+    environment:
+      PEERDB_CATALOG_HOST: catalog
+      PEERDB_CATALOG_PORT: "5432"
+      PEERDB_CATALOG_USER: postgres
+      PEERDB_CATALOG_PASSWORD: postgres
+      PEERDB_CATALOG_DATABASE: postgres
+      TEMPORAL_HOST_PORT: temporal:7233
+      PEERDB_TEMPORAL_NAMESPACE: default
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "8112:8112"
+      - "8113:8113"
+    depends_on:
+      temporal-admin-tools:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  flow-snapshot-worker:
+    image: ghcr.io/peerdb-io/flow-snapshot-worker:stable-v0.36.17
+    container_name: flow-snapshot-worker
+    restart: unless-stopped
+    environment:
+      # --- Variables agregadas ---
+      PEERDB_CATALOG_HOST: catalog
+      PEERDB_CATALOG_PORT: "5432"
+      PEERDB_CATALOG_USER: postgres
+      PEERDB_CATALOG_PASSWORD: postgres
+      PEERDB_CATALOG_DATABASE: postgres
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      # ---------------------------
+      TEMPORAL_HOST_PORT: temporal:7233
+      PEERDB_TEMPORAL_NAMESPACE: default
+    depends_on:
+      temporal-admin-tools:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  flow-worker:
+    image: ghcr.io/peerdb-io/flow-worker:stable-v0.36.17
+    container_name: flow-worker
+    restart: unless-stopped
+    environment:
+      PEERDB_CATALOG_HOST: catalog
+      PEERDB_CATALOG_PORT: "5432"
+      PEERDB_CATALOG_USER: postgres
+      PEERDB_CATALOG_PASSWORD: postgres
+      PEERDB_CATALOG_DATABASE: postgres
+      TEMPORAL_HOST_PORT: temporal:7233
+      PEERDB_TEMPORAL_NAMESPACE: default
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      temporal-admin-tools:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  peerdb:
+    image: ghcr.io/peerdb-io/peerdb-server:stable-v0.36.17
+    container_name: peerdb-server
+    restart: unless-stopped
+    stop_signal: SIGINT
+    environment:
+      PEERDB_CATALOG_HOST: catalog
+      PEERDB_CATALOG_PORT: "5432"
+      PEERDB_CATALOG_USER: postgres
+      PEERDB_CATALOG_PASSWORD: postgres
+      PEERDB_CATALOG_DATABASE: postgres
+      PEERDB_PASSWORD: peerdb
+      PEERDB_FLOW_SERVER_ADDRESS: grpc://flow-api:8112
+      # --- Añade estas 3 líneas ---
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      # ----------------------------
+      RUST_LOG: info
+      RUST_BACKTRACE: 1
+    ports:
+      - "9900:9900"
+    depends_on:
+      catalog:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  peerdb-ui:
+    image: ghcr.io/peerdb-io/peerdb-ui:stable-v0.36.17
+    container_name: peerdb-ui
+    restart: unless-stopped
+    environment:
+      PEERDB_CATALOG_HOST: catalog
+      PEERDB_CATALOG_PORT: "5432"
+      PEERDB_CATALOG_USER: postgres
+      PEERDB_CATALOG_PASSWORD: postgres
+      PEERDB_CATALOG_DATABASE: postgres
+      PEERDB_FLOW_SERVER_HTTP: http://flow-api:8113
+    ports:
+      - "3000:3000"
+    depends_on:
+      - flow-api
+    networks:
+      - app-network
+
+  # Contenedor de un solo uso: crea los peers y el mirror CDC automáticamente
+  peerdb-init:
+    image: postgres:16-alpine
+    container_name: peerdb-init
+    restart: "no"
+    volumes:
+      - ./peerdb/init-mirror.sql:/init-mirror.sql:ro
+    entrypoint: |
+          /bin/sh -c "
+          echo 'Esperando a que PeerDB abra su puerto...'
+          until pg_isready -h peerdb -p 9900 2>/dev/null; do sleep 3; done;
+
+          echo 'Puerto abierto. Intentando inyectar configuración CDC...'
+          until psql -v ON_ERROR_STOP=1 \"host=peerdb port=9900 user=postgres password=peerdb\" -f /init-mirror.sql; do
+            echo 'Los workers/DNS internos aún no están listos. Reintentando en 5 segundos...'
+            sleep 5;
+          done;
+
+          echo '¡Tuberías CDC configuradas exitosamente!'
+          "
+    depends_on:
+      peerdb:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      temporal-admin-tools:        # ← nueva dependencia
+        condition: service_healthy # ← ahora sí espera a MirrorName
+    networks:
+      - app-network
+
 volumes:
   clickhouse_data:
   postgres_data:
+  peerdb_catalog_data:
+  peerdb_minio_data:
 
 networks:
   app-network:
     driver: bridge
 
-
-  # ─────────────────────────────────────────────
-  #  Streamlit — Dashboard
-  # ─────────────────────────────────────────────
-#  streamlit-dashboard:
-#    build:
-#      context: ./streamlit-dashboard
-#      dockerfile: Dockerfile
-#    container_name: streamlit-dashboard
-#    restart: unless-stopped
-
-#    Este lo mantengo porque es importante para futuros proyectos
-#    environment:
-#      DB_HOST: postgres
-#      DB_PORT: "5432"
-#      DB_NAME: pase_lista
-#      DB_USER: admin
-#      DB_PASSWORD: admin123
-
-#    ports:
-#      - "8502:8501"
-#    depends_on:
-#      - postgres
-#    networks:
-#      - app-network
-
-# JUST TESTEO

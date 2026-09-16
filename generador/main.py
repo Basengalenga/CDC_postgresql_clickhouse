@@ -19,14 +19,12 @@ MENU = [
 active_orders = []
 customer_ids = []
 menu_item_ids = []
+menu_prices = {}  # {item_id: price} — usado para no hardcodear el precio en el worker
 
 async def setup_database(pool):
     """Initializes schema, customers, and menu items."""
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            # Read and execute the SQL schema block from above (assuming it's saved or pasted here)
-            # For brevity, let's assume tables exist or we insert seed data directly
-            
             # Seed Menu Items
             for cat, meat, price in MENU:
                 await cur.execute("""
@@ -35,11 +33,15 @@ async def setup_database(pool):
                     ON CONFLICT DO NOTHING RETURNING item_id;
                 """, (f"{cat} de {meat}", cat, meat, price))
                 res = await cur.fetchone()
-                if res: menu_item_ids.append(res[0])
-            
-            if not menu_item_ids: # If already populated
-                await cur.execute("SELECT item_id FROM menu_items")
-                menu_item_ids.extend([row[0] async for row in cur])
+                if res:
+                    menu_item_ids.append(res[0])
+                    menu_prices[res[0]] = price
+
+            if not menu_item_ids:  # If already populated
+                await cur.execute("SELECT item_id, current_price FROM menu_items")
+                async for row in cur:
+                    menu_item_ids.append(row[0])
+                    menu_prices[row[0]] = float(row[1])
 
             # Seed 1000 Customers
             for i in range(1000):
@@ -81,9 +83,8 @@ async def worker(pool, worker_id, stats):
                         for _ in range(random.randint(1, 5)):
                             item_id = random.choice(menu_item_ids)
                             quantity = random.randint(1, 3)
-                            # Hardcoded price for simulation speed, in reality fetch from menu
-                            price = 30.00 
-                            
+                            price = menu_prices[item_id]  # precio real del menú, ya no hardcodeado
+
                             await cur.execute("""
                                 INSERT INTO order_items (order_id, item_id, quantity, unit_price)
                                 VALUES (%s, %s, %s, %s)
